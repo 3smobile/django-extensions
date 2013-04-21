@@ -32,7 +32,7 @@ Improvements:
 
 import sys
 import django
-from django.db import models
+from django.db.models import AutoField, BooleanField, FileField, ForeignKey
 from django.core.exceptions import ObjectDoesNotExist
 from django.core.management.base import BaseCommand
 from django.utils.encoding import smart_unicode, force_unicode
@@ -54,31 +54,22 @@ def orm_item_locator(orm_obj):
     original_pk_name = pk_name
     pk_value = getattr(orm_obj, pk_name)
 
-    while hasattr(pk_value,"_meta" ) \
-        and hasattr( pk_value._meta , "pk" ) \
-        and hasattr( pk_value._meta.pk , "name" ):
-
-        the_class=pk_value._meta.object_name
-        pk_name=pk_value._meta.pk.name
-        pk_value=getattr(pk_value, pk_name)
+    while hasattr(pk_value, "_meta") and hasattr(pk_value._meta, "pk") and hasattr(pk_value._meta.pk, "name"):
+        the_class = pk_value._meta.object_name
+        pk_name = pk_value._meta.pk.name
+        pk_value = getattr(pk_value, pk_name)
 
     clean_dict = make_clean_dict(orm_obj.__dict__)
 
     for key in clean_dict:
         v = clean_dict[key]
-        if  v != None and \
-            not isinstance(v , str ) and \
-            not isinstance(v , unicode ) and \
-            not isinstance(v , int ) and \
-            not isinstance(v , long ) and \
-            not isinstance(v , float ) and \
-            not isinstance(v , datetime.datetime ) :
+        if v is not None and not isinstance(v, (basestring, int, long, float, datetime.datetime)):
+            clean_dict[key] = u"%s" % v
 
-            clean_dict[key]=u"%s" % v
-
-    output = """ locate_object(%s, "%s", %s, "%s", %s, %s ) """ % (
-            original_class, original_pk_name,
-            the_class, pk_name, pk_value, clean_dict)
+    output = """ importer.locate_object(%s, "%s", %s, "%s", %s, %s ) """ % (
+        original_class, original_pk_name,
+        the_class, pk_name, pk_value, clean_dict
+    )
     return output
 
 
@@ -97,7 +88,8 @@ class Command(BaseCommand):
         context = {}
 
         # Create a dumpscript object and let it format itself as a string
-        print Script(models=models, context=context)
+        self.stdout.write(str(Script(models=models, context=context, stdout=self.stdout, stderr=self.stderr)))
+        self.stdout.write("\n")
 
 
 def get_models(app_labels):
@@ -111,7 +103,6 @@ def get_models(app_labels):
 
     # These models are not to be output, e.g. because they can be generated automatically
     # TODO: This should be "appname.modelname" string
-    from django.contrib.contenttypes.models import ContentType
     EXCLUDED_MODELS = (ContentType, )
 
     models = []
@@ -141,15 +132,22 @@ class Code(object):
         in this class.
     """
 
-    def __init__(self):
-        self.imports = {}
-        self.indent = -1
+    def __init__(self, indent=-1, stdout=None, stderr=None):
+
+        if not stdout:
+            stdout = sys.stdout
+        if not stderr:
+            stderr = sys.stderr
+
+        self.indent = indent
+        self.stdout = stdout
+        self.stderr = stderr
 
     def __str__(self):
         """ Returns a string representation of this script.
         """
         if self.imports:
-            sys.stderr.write(repr(self.import_lines))
+            self.stderr.write(repr(self.import_lines))
             return flatten_blocks([""] + self.import_lines + [""] + self.lines, num_indents=self.indent)
         else:
             return flatten_blocks(self.lines, num_indents=self.indent)
@@ -167,11 +165,13 @@ class Code(object):
 class ModelCode(Code):
     " Produces a python script that can recreate data for a given model class. "
 
-    def __init__(self, model, context={}):
+    def __init__(self, model, context=None, stdout=None, stderr=None):
+        super(ModelCode, self).__init__(indent=0, stdout=stdout, stderr=stderr)
         self.model = model
+        if context is None:
+            context = {}
         self.context = context
         self.instances = []
-        self.indent = 0
 
     def get_imports(self):
         """ Returns a dictionary of import statements, with the variable being
@@ -187,7 +187,7 @@ class ModelCode(Code):
         code = []
 
         for counter, item in enumerate(self.model._default_manager.all()):
-            instance = InstanceCode(instance=item, id=counter + 1, context=self.context)
+            instance = InstanceCode(instance=item, id=counter + 1, context=self.context, stdout=self.stdout, stderr=self.stderr)
             self.instances.append(instance)
             if instance.waiting_list:
                 code += instance.lines
@@ -206,18 +206,20 @@ class ModelCode(Code):
 class InstanceCode(Code):
     " Produces a python script that can recreate data for a given model instance. "
 
-    def __init__(self, instance, id, context={}):
+    def __init__(self, instance, id, context=None, stdout=None, stderr=None):
         """ We need the instance in question and an id """
+
+        super(InstanceCode, self).__init__(indent=0, stdout=stdout, stderr=stderr)
+        self.imports = {}
 
         self.instance = instance
         self.model = self.instance.__class__
+        if context is None:
+            context = {}
         self.context = context
         self.variable_name = "%s_%s" % (self.instance._meta.db_table, id)
         self.skip_me = None
         self.instantiated = False
-
-        self.indent = 0
-        self.imports = {}
 
         self.waiting_list = list(self.model._meta.fields)
 
@@ -255,7 +257,7 @@ class InstanceCode(Code):
         # Print the save command for our new object
         # e.g. model_name_35.save()
         if code_lines:
-            code_lines.append("%s.save()\n" % (self.variable_name))
+            code_lines.append("%s = importer.save_or_locate(%s)\n" % (self.variable_name, self.variable_name))
 
         code_lines += self.get_many_to_many_lines(force=force)
 
@@ -283,7 +285,7 @@ class InstanceCode(Code):
             if not hasattr(self, '_SKIP_VERSION'):
                 version = django.VERSION
                 # no, it isn't lisp. I swear.
-                self._SKIP_VERSION =  (
+                self._SKIP_VERSION = (
                     version[0] > 1 or (  # django 2k... someday :)
                         version[0] == 1 and (  # 1.x
                             version[1] >= 4 or  # 1.4+
@@ -292,7 +294,7 @@ class InstanceCode(Code):
                             )
                         )
                     )
-                ) and 2 or 1
+                ) and 2 or 1  # NOQA
             return self._SKIP_VERSION
 
         if get_skip_version() == 1:
@@ -365,11 +367,11 @@ class InstanceCode(Code):
                 value = get_attribute_value(self.instance, field, self.context, force=force)
                 code_lines.append('%s.%s = %s' % (self.variable_name, field.name, value))
                 self.waiting_list.remove(field)
-            except SkipValue, e:
+            except SkipValue:
                 # Remove from the waiting list and move on
                 self.waiting_list.remove(field)
                 continue
-            except DoLater, e:
+            except DoLater:
                 # Move on, maybe next time
                 continue
 
@@ -390,8 +392,8 @@ class InstanceCode(Code):
                     self.many_to_many_waiting_list[field].remove(rel_item)
                 except KeyError:
                     if force:
-                        item_locator=orm_item_locator( rel_item )                        
-                        self.context["__extra_imports"][rel_item._meta.object_name] = rel_item.__module__                        
+                        item_locator = orm_item_locator(rel_item)
+                        self.context["__extra_imports"][rel_item._meta.object_name] = rel_item.__module__
                         lines.append('%s.%s.add( %s )' % (self.variable_name, field.name, item_locator))
                         self.many_to_many_waiting_list[field].remove(rel_item)
 
@@ -404,15 +406,63 @@ class InstanceCode(Code):
 class Script(Code):
     " Produces a complete python script that can recreate data for the given apps. "
 
-    def __init__(self, models, context={}):
-        self.models = models
-        self.context = context
-
-        self.indent = -1
+    def __init__(self, models, context=None, stdout=None, stderr=None):
+        super(Script, self).__init__(stdout=stdout, stderr=stderr)
         self.imports = {}
+
+        self.models = models
+        if context is None:
+            context = {}
+        self.context = context
 
         self.context["__avaliable_models"] = set(models)
         self.context["__extra_imports"] = {}
+
+    def _queue_models(self, models, context):
+        """ Works an an appropriate ordering for the models.
+            This isn't essential, but makes the script look nicer because
+            more instances can be defined on their first try.
+        """
+
+        # Max number of cycles allowed before we call it an infinite loop.
+        MAX_CYCLES = 5
+
+        model_queue = []
+        number_remaining_models = len(models)
+        allowed_cycles = MAX_CYCLES
+
+        while number_remaining_models > 0:
+            previous_number_remaining_models = number_remaining_models
+
+            model = models.pop(0)
+
+            # If the model is ready to be processed, add it to the list
+            if check_dependencies(model, model_queue, context["__avaliable_models"]):
+                model_class = ModelCode(model=model, context=context, stdout=self.stdout, stderr=self.stderr)
+                model_queue.append(model_class)
+
+            # Otherwise put the model back at the end of the list
+            else:
+                models.append(model)
+
+            # Check for infinite loops.
+            # This means there is a cyclic foreign key structure
+            # That cannot be resolved by re-ordering
+            number_remaining_models = len(models)
+            if number_remaining_models == previous_number_remaining_models:
+                allowed_cycles -= 1
+                if allowed_cycles <= 0:
+                    # Add the remaining models, but do not remove them from the model list
+                    missing_models = [ModelCode(model=m, context=context, stdout=self.stdout, stderr=self.stderr) for m in models]
+                    model_queue += missing_models
+                    # Replace the models with the model class objects
+                    # (sure, this is a little bit of hackery)
+                    models[:] = missing_models
+                    break
+            else:
+                allowed_cycles = MAX_CYCLES
+
+        return model_queue
 
     def get_lines(self):
         """ Returns a list of lists or strings, representing the code body.
@@ -421,10 +471,10 @@ class Script(Code):
         code = [self.FILE_HEADER.strip()]
 
         # Queue and process the required models
-        for model_class in queue_models(self.models, context=self.context):
+        for model_class in self._queue_models(self.models, context=self.context):
             msg = 'Processing model: %s\n' % model_class.model.__name__
-            sys.stderr.write(msg)
-            code.append("    #"+msg)
+            self.stderr.write(msg)
+            code.append("    #" + msg)
             code.append(model_class.import_lines)
             code.append("")
             code.append(model_class.lines)
@@ -432,8 +482,8 @@ class Script(Code):
         # Process left over foreign keys from cyclic models
         for model in self.models:
             msg = 'Re-processing model: %s\n' % model.model.__name__
-            sys.stderr.write(msg)
-            code.append("    #"+msg)
+            self.stderr.write(msg)
+            code.append("    #" + msg)
             for instance in model.instances:
                 if instance.waiting_list or instance.many_to_many_waiting_list:
                     code.append(instance.get_lines(force=True))
@@ -441,9 +491,8 @@ class Script(Code):
         code.insert(1, "    #initial imports")
         code.insert(2, "")
         for key, value in self.context["__extra_imports"].items():
-            code.insert(2 , "    from %s import %s" % (value, key) )
-        code.insert(2 + len(self.context["__extra_imports"]), self.locate_object_function)
-        
+            code.insert(2, "    from %s import %s" % (value, key))
+
         return code
 
     lines = property(get_lines)
@@ -454,28 +503,51 @@ class Script(Code):
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-# This file has been automatically generated, changes may be lost if you
-# go and generate it again. It was generated with the following command:
+# This file has been automatically generated.
+# Instead of changing it, create a file called import_helper.py
+# and put there a class called ImportHelper(object) in it.
+#
+# This class will be specially casted so that instead of extending object,
+# it will actually extend the class BasicImportHelper()
+#
+# That means you just have to overload the methods you want to
+# change, leaving the other ones inteact.
+#
+# Something that you might want to do is use transactions, for example.
+#
+# Also, don't forget to add the necessary Django imports.
+#
+# This file was generated with the following command:
 # %s
 #
 # to restore it, run
-# manage.py runscript module_name.this_script_name 
+# manage.py runscript module_name.this_script_name
 #
 # example: if manage.py is at ./manage.py
 # and the script is at ./some_folder/some_script.py
 # you must make sure ./some_folder/__init__.py exists
 # and run  ./manage.py runscript some_folder.some_script
 
-import datetime
-from decimal import Decimal
-from django.contrib.contenttypes.models import ContentType
+class BasicImportHelper(object):
 
-def run():
+    def pre_import(self):
+        pass
 
-""" % " ".join(sys.argv)
+    def run_import(self, import_data):
+        import_data()
 
-    locate_object_function = """
-    def locate_object(original_class, original_pk_name, the_class, pk_name, pk_value, obj_content):
+    def post_import(self):
+        pass
+
+    def locate_similar(self, current_object, search_data):
+        #you will probably want to call this method from save_or_locate()
+        #example:
+        #new_obj = self.locate_similar(the_obj, {"national_id": the_obj.national_id } )
+
+        the_obj = current_object.__class__.objects.get(**search_data)
+        return the_obj
+
+    def locate_object(self, original_class, original_pk_name, the_class, pk_name, pk_value, obj_content):
         #You may change this function to do specific lookup for specific objects
         #
         #original_class class of the django orm's object that needs to be located
@@ -485,7 +557,7 @@ def run():
         #pk_value       value of the primary_key
         #obj_content    content of the object which was not exported.
         #
-        #you should use obj_content to locate the object on the target db    
+        #you should use obj_content to locate the object on the target db
         #
         #and example where original_class and the_class are different is
         #when original_class is Farmer and
@@ -493,19 +565,61 @@ def run():
         #need to locate Person in order to instantiate that Farmer
         #
         #example:
-        #if the_class == SurveyResultFormat or the_class == SurveyType or the_class == SurveyState:        
+        #if the_class == SurveyResultFormat or the_class == SurveyType or the_class == SurveyState:
         #    pk_name="name"
         #    pk_value=obj_content[pk_name]
         #if the_class == StaffGroup:
         #    pk_value=8
-            
+
         search_data = { pk_name: pk_value }
-        the_obj =the_class.objects.get(**search_data)
+        the_obj = the_class.objects.get(**search_data)
         #print the_obj
-        return the_obj    
+        return the_obj
 
-"""
 
+    def save_or_locate(self, the_obj):
+        #change this if you want to locate the object in the database
+        try:
+            the_obj.save()
+        except:
+            print "---------------"
+            print "Error saving the following object:"
+            print the_obj.__class__
+            print " "
+            print the_obj.__dict__
+            print " "
+            print the_obj
+            print " "
+            print "---------------"
+
+            raise
+        return the_obj
+
+
+importer = None
+try:
+    import import_helper
+    #we need this so ImportHelper can extend BasicImportHelper, although import_helper.py
+    #has no knowlodge of this class
+    importer = type("DynamicImportHelper", (import_helper.ImportHelper, BasicImportHelper ) , {} )()
+except ImportError, e:
+    if e == "No module named import_helper":
+        importer = BasicImportHelper()
+    else:
+        raise
+
+import datetime
+from decimal import Decimal
+from django.contrib.contenttypes.models import ContentType
+
+def run():
+    importer.pre_import()
+    importer.run_import(import_data)
+    importer.post_import()
+
+def import_data():
+
+""" % " ".join(sys.argv)
 
 
 # HELPER FUNCTIONS
@@ -540,19 +654,19 @@ def get_attribute_value(item, field, context, force=False):
         raise SkipValue('Could not find object for %s.%s, ignoring.\n' % (item.__class__.__name__, field.name))
 
     # AutoField: We don't include the auto fields, they'll be automatically recreated
-    if isinstance(field, models.AutoField):
+    if isinstance(field, AutoField):
         raise SkipValue()
 
     # Some databases (eg MySQL) might store boolean values as 0/1, this needs to be cast as a bool
-    elif isinstance(field, models.BooleanField) and value is not None:
+    elif isinstance(field, BooleanField) and value is not None:
         return repr(bool(value))
 
     # Post file-storage-refactor, repr() on File/ImageFields no longer returns the path
-    elif isinstance(field, models.FileField):
+    elif isinstance(field, FileField):
         return repr(force_unicode(value))
 
     # ForeignKey fields, link directly using our stored python variable name
-    elif isinstance(field, models.ForeignKey) and value is not None:
+    elif isinstance(field, ForeignKey) and value is not None:
 
         # Special case for contenttype foreign keys: no need to output any
         # content types in this script, as they can be generated again
@@ -573,9 +687,9 @@ def get_attribute_value(item, field, context, force=False):
                 raise SkipValue()
             # Return the variable name listed in the context
             return "%s" % variable_name
-        elif value.__class__ not in context["__avaliable_models"] or force:            
+        elif value.__class__ not in context["__avaliable_models"] or force:
             context["__extra_imports"][value._meta.object_name] = value.__module__
-            item_locator=orm_item_locator( value )
+            item_locator = orm_item_locator(value)
             return item_locator
         else:
             raise DoLater('(FK) %s.%s\n' % (item.__class__.__name__, field.name))
@@ -584,59 +698,13 @@ def get_attribute_value(item, field, context, force=False):
     else:
         return repr(value)
 
+
 def make_clean_dict(the_dict):
     if "_state" in the_dict:
         clean_dict = the_dict.copy()
         del clean_dict["_state"]
         return clean_dict
     return the_dict
-
-
-def queue_models(models, context):
-    """ Works an an appropriate ordering for the models.
-        This isn't essential, but makes the script look nicer because
-        more instances can be defined on their first try.
-    """
-
-    # Max number of cycles allowed before we call it an infinite loop.
-    MAX_CYCLES = 5
-
-    model_queue = []
-    number_remaining_models = len(models)
-    allowed_cycles = MAX_CYCLES
-
-    while number_remaining_models > 0:
-        previous_number_remaining_models = number_remaining_models
-
-        model = models.pop(0)
-
-        # If the model is ready to be processed, add it to the list
-        if check_dependencies(model, model_queue, context["__avaliable_models"]):
-            model_class = ModelCode(model=model, context=context)
-            model_queue.append(model_class)
-
-        # Otherwise put the model back at the end of the list
-        else:
-            models.append(model)
-
-        # Check for infinite loops.
-        # This means there is a cyclic foreign key structure
-        # That cannot be resolved by re-ordering
-        number_remaining_models = len(models)
-        if number_remaining_models == previous_number_remaining_models:
-            allowed_cycles -= 1
-            if allowed_cycles <= 0:
-                # Add the remaining models, but do not remove them from the model list
-                missing_models = [ModelCode(model=m, context=context) for m in models]
-                model_queue += missing_models
-                # Replace the models with the model class objects
-                # (sure, this is a little bit of hackery)
-                models[:] = missing_models
-                break
-        else:
-            allowed_cycles = MAX_CYCLES
-
-    return model_queue
 
 
 def check_dependencies(model, model_queue, avaliable_models):
