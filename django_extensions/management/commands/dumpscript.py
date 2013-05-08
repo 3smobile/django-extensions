@@ -31,13 +31,20 @@ Improvements:
 """
 
 import sys
+import datetime
+import six
+
 import django
 from django.db.models import AutoField, BooleanField, FileField, ForeignKey
 from django.core.exceptions import ObjectDoesNotExist
 from django.core.management.base import BaseCommand
-from django.utils.encoding import smart_unicode, force_unicode
+
+# conditional import, force_unicode was renamed in Django 1.5
 from django.contrib.contenttypes.models import ContentType
-import datetime
+try:
+    from django.utils.encoding import smart_unicode, force_unicode  # NOQA
+except ImportError:
+    from django.utils.encoding import smart_text as smart_unicode, force_text as force_unicode  # NOQA
 
 
 def orm_item_locator(orm_obj):
@@ -63,8 +70,8 @@ def orm_item_locator(orm_obj):
 
     for key in clean_dict:
         v = clean_dict[key]
-        if v is not None and not isinstance(v, (basestring, int, long, float, datetime.datetime)):
-            clean_dict[key] = u"%s" % v
+        if v is not None and not isinstance(v, (six.string_types, six.integer_types, float, datetime.datetime)):
+            clean_dict[key] = six.u("%s" % v)
 
     output = """ importer.locate_object(%s, "%s", %s, "%s", %s, %s ) """ % (
         original_class, original_pk_name,
@@ -528,11 +535,16 @@ class Script(Code):
 # you must make sure ./some_folder/__init__.py exists
 # and run  ./manage.py runscript some_folder.some_script
 
+from django.db import transaction
+
 class BasicImportHelper(object):
 
     def pre_import(self):
         pass
 
+    # You probably want to uncomment on of these two lines
+    # @transaction.atomic  # Django 1.6
+    # @transaction.commit_on_success  # Django <1.6
     def run_import(self, import_data):
         import_data()
 
@@ -573,7 +585,7 @@ class BasicImportHelper(object):
 
         search_data = { pk_name: pk_value }
         the_obj = the_class.objects.get(**search_data)
-        #print the_obj
+        #print(the_obj)
         return the_obj
 
 
@@ -582,15 +594,15 @@ class BasicImportHelper(object):
         try:
             the_obj.save()
         except:
-            print "---------------"
-            print "Error saving the following object:"
-            print the_obj.__class__
-            print " "
-            print the_obj.__dict__
-            print " "
-            print the_obj
-            print " "
-            print "---------------"
+            print("---------------")
+            print("Error saving the following object:")
+            print(the_obj.__class__)
+            print(" ")
+            print(the_obj.__dict__)
+            print(" ")
+            print(the_obj)
+            print(" ")
+            print("---------------")
 
             raise
         return the_obj
@@ -602,8 +614,8 @@ try:
     #we need this so ImportHelper can extend BasicImportHelper, although import_helper.py
     #has no knowlodge of this class
     importer = type("DynamicImportHelper", (import_helper.ImportHelper, BasicImportHelper ) , {} )()
-except ImportError, e:
-    if e == "No module named import_helper":
+except ImportError as e:
+    if str(e) == "No module named import_helper":
         importer = BasicImportHelper()
     else:
         raise
@@ -637,7 +649,7 @@ def flatten_blocks(lines, num_indents=-1):
         return ""
 
     # If this is a string, add the indentation and finish here
-    if isinstance(lines, basestring):
+    if isinstance(lines, six.string_types):
         return INDENTATION * num_indents + lines
 
     # If this is not a string, join the lines and recurse
